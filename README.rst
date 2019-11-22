@@ -134,7 +134,12 @@ Available command line options:
 ``--namespace``
     Restrict the downscaler to work only in a single namespace (default: all namespaces). This is mainly useful for deployment scenarios where the deployer of kube-downscaler only has access to a given namespace (instead of cluster access).
 ``--include-resources``
-    Downscale resources of this kind as comma separated list. [deployments, statefulsets, stacks] (default: deployments)
+    Downscale resources of this kind as comma separated list. [deployments, statefulsets, daemonsets, stacks] (default: deployments).
+
+.. code-block:: bash
+
+    --include-resources 'deployments,daemonsets,statefulsets,stacks'
+
 ``--grace-period``
     Grace period in seconds for new deployments before scaling them down (default: 15min). The grace period counts from time of creation of the deployment, i.e. updated deployments will immediately be scaled down regardless of the grace period.
 ``--upscale-period``

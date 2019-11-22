@@ -2,13 +2,14 @@ import os
 
 import argparse
 
-VALID_RESOURCES = frozenset(["deployments", "statefulsets", "stacks"])
+VALID_RESOURCES = frozenset(["deployments", "statefulsets", "daemonsets", "stacks"])
 
 
 def check_include_resources(value):
     resources = frozenset(value.split(','))
     if not resources <= VALID_RESOURCES:
-        raise argparse.ArgumentTypeError(f"--include-resources argument should contain a subset of [{', '.join(VALID_RESOURCES)}]")
+        raise argparse.ArgumentTypeError(f"--include-resources argument should contain a subset of [{', '.join(VALID_RESOURCES)}]. "
+                                         f"Example: --include-resources '{','.join(VALID_RESOURCES)}'")
     return value
 
 
@@ -23,7 +24,9 @@ def get_parser():
     parser.add_argument('--interval', type=int, help='Loop interval (default: 30s)', default=30)
     parser.add_argument('--namespace', help='Namespace')
     parser.add_argument('--include-resources', type=check_include_resources, default="deployments",
-                        help='Downscale resources of this kind as comma separated list. [deployments, statefulsets, stacks] (default: deployments)')
+                        help='Downscale resources of this kind as comma separated list with no spaces. '
+                             '[deployments, statefulsets, daemonsets] (default: deployments). '
+                             'Example: --include-resources \'deployments,statefulsets\'')
     parser.add_argument('--grace-period', type=int,
                         help='Grace period in seconds for deployments before scaling down (default: 15min)',
                         default=900)

@@ -4,11 +4,12 @@ import pykube
 from typing import FrozenSet
 
 from kube_downscaler import helper
-from pykube import Deployment, StatefulSet
+from pykube import Deployment, StatefulSet, DaemonSet
 from kube_downscaler.resources.stack import Stack
 
 logger = logging.getLogger(__name__)
 ORIGINAL_REPLICAS_ANNOTATION = 'downscaler/original-replicas'
+ORIGINAL_NODESELECTOR_ANNOTATION = 'downscaler/original-nodeSelector'
 FORCE_UPTIME_ANNOTATION = 'downscaler/force-uptime'
 UPSCALE_PERIOD_ANNOTATION = 'downscaler/upscale-period'
 DOWNSCALE_PERIOD_ANNOTATION = 'downscaler/downscale-period'
@@ -123,6 +124,86 @@ def autoscale_resource(resource: pykube.objects.NamespacedAPIObject, upscale_per
         logger.exception('Failed to process %s %s/%s : %s', resource.kind, resource.namespace, resource.name, str(e))
 
 
+def autoscale_daemonset(
+        daemonset: pykube.objects.DaemonSet, upscale_period: str, downscale_period: str,
+        default_uptime: str, default_downtime: str, forced_uptime: bool, dry_run: bool,
+        now: datetime.datetime, grace_period: int, namespace_excluded=False):
+    try:
+        exclude = namespace_excluded or ignore_resource(daemonset)
+        original_nodeselector = daemonset.annotations.get(ORIGINAL_NODESELECTOR_ANNOTATION)
+
+        if exclude and not original_nodeselector:
+            logger.debug('%s %s/%s was excluded', daemonset.kind, daemonset.namespace, daemonset.name)
+        else:
+            nodeselector = None
+            if 'nodeSelector' in daemonset.obj['spec']['template']['spec']:
+                nodeselector = daemonset.obj.get('spec')['template']['spec']['nodeSelector']
+            ignore = False
+
+            upscale_period = daemonset.annotations.get(UPSCALE_PERIOD_ANNOTATION, upscale_period)
+            downscale_period = daemonset.annotations.get(
+                DOWNSCALE_PERIOD_ANNOTATION, downscale_period)
+            if forced_uptime or (exclude and original_nodeselector):
+                uptime = "forced"
+                downtime = "ignored"
+                is_uptime = True
+            elif upscale_period != 'never' or downscale_period != 'never':
+                uptime = upscale_period
+                downtime = downscale_period
+                if helper.matches_time_spec(now, uptime) and helper.matches_time_spec(now, downtime):
+                    logger.debug('Upscale and downscale periods overlap, do nothing')
+                    ignore = True
+                elif helper.matches_time_spec(now, uptime):
+                    is_uptime = True
+                elif helper.matches_time_spec(now, downtime):
+                    is_uptime = False
+                else:
+                    ignore = True
+                logger.debug('Periods checked: upscale=%s, downscale=%s, ignore=%s, is_uptime=%s',
+                             upscale_period, downscale_period, ignore, is_uptime)
+            else:
+                uptime = daemonset.annotations.get(UPTIME_ANNOTATION, default_uptime)
+                downtime = daemonset.annotations.get(DOWNTIME_ANNOTATION, default_downtime)
+                is_uptime = helper.matches_time_spec(
+                    now, uptime) and not helper.matches_time_spec(now, downtime)
+
+            logger.debug('%s %s/%s has "%s" nodeSelector (original: %s, uptime: %s)',
+                         daemonset.kind, daemonset.namespace, daemonset.name, nodeselector, original_nodeselector, uptime)
+            update_needed = False
+
+            if not ignore and is_uptime and nodeselector is not None \
+                    and 'non-existing' in daemonset.obj['spec']['template']['spec']['nodeSelector'] \
+                    and daemonset.obj['spec']['template']['spec']['nodeSelector']['non-existing'] == 'true':
+                logger.info('Scaling up %s %s/%s from nodeSelector "%s" to "%s" (uptime: %s, downtime: %s)',
+                            daemonset.kind, daemonset.namespace, daemonset.name, nodeselector, original_nodeselector,
+                            uptime, downtime)
+                daemonset.obj['spec']['template']['spec']['nodeSelector'] = original_nodeselector
+                update_needed = True
+            elif not ignore and not is_uptime and (nodeselector is None or nodeselector['non-existing'] != 'true'):
+                target_nodeselector = {'non-existing': 'true'}
+                if within_grace_period(daemonset, grace_period, now):
+                    logger.info('%s %s/%s within grace period (%ds), not scaling down (yet)',
+                                daemonset.kind, daemonset.namespace, daemonset.name, grace_period)
+                else:
+                    logger.info('Scaling down %s %s/%s from nodeSelector "%s" to "%s" (uptime: %s, downtime: %s)',
+                                daemonset.kind, daemonset.namespace, daemonset.name, nodeselector, target_nodeselector,
+                                uptime, downtime)
+                    # resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] = str(replicas)
+                    # resource.replicas = target_replicas
+                    daemonset.annotations[ORIGINAL_NODESELECTOR_ANNOTATION] = str(nodeselector)
+                    daemonset.obj.get('spec')['template']['spec']['nodeSelector'] = target_nodeselector
+                    update_needed = True
+            if update_needed:
+                if dry_run:
+                    logger.info('**DRY-RUN**: would update %s %s/%s',
+                                daemonset.kind, daemonset.namespace, daemonset.name)
+                else:
+                    daemonset.update()
+    except Exception as e:
+        logger.exception('Failed to process %s %s/%s : %s', daemonset.kind,
+                         daemonset.namespace, daemonset.name, str(e))
+
+
 def autoscale_resources(api, kind, namespace: str,
                         exclude_namespaces: FrozenSet[str], exclude_names: FrozenSet[str],
                         upscale_period: str, downscale_period: str,
@@ -145,9 +226,17 @@ def autoscale_resources(api, kind, namespace: str,
         downscale_period_for_namespace = namespace_obj.annotations.get(DOWNSCALE_PERIOD_ANNOTATION, downscale_period)
         forced_uptime_for_namespace = namespace_obj.annotations.get(FORCE_UPTIME_ANNOTATION, forced_uptime)
 
-        autoscale_resource(resource, upscale_period_for_namespace, downscale_period_for_namespace,
-                           default_uptime_for_namespace, default_downtime_for_namespace, forced_uptime_for_namespace,
-                           dry_run, now, grace_period, default_downtime_replicas_for_namespace, namespace_excluded=excluded)
+        if kind == pykube.objects.DaemonSet:
+            autoscale_daemonset(
+                resource, upscale_period_for_namespace, downscale_period_for_namespace,
+                default_uptime_for_namespace, default_downtime_for_namespace,
+                forced_uptime_for_namespace, dry_run, now, grace_period, namespace_excluded=excluded)
+        else:
+            autoscale_resource(
+                resource, upscale_period_for_namespace, downscale_period_for_namespace,
+                default_uptime_for_namespace, default_downtime_for_namespace,
+                forced_uptime_for_namespace, dry_run, now, grace_period,
+                default_downtime_replicas_for_namespace, namespace_excluded=excluded)
 
 
 def scale(namespace: str, upscale_period: str, downscale_period: str,
@@ -167,6 +256,9 @@ def scale(namespace: str, upscale_period: str, downscale_period: str,
                             default_uptime, default_downtime, forced_uptime, dry_run, now, grace_period, downtime_replicas)
     if 'statefulsets' in include_resources:
         autoscale_resources(api, StatefulSet, namespace, exclude_namespaces, exclude_statefulsets, upscale_period, downscale_period,
+                            default_uptime, default_downtime, forced_uptime, dry_run, now, grace_period, downtime_replicas)
+    if 'daemonsets' in include_resources:
+        autoscale_resources(api, DaemonSet, namespace, exclude_namespaces, exclude_statefulsets, upscale_period, downscale_period,
                             default_uptime, default_downtime, forced_uptime, dry_run, now, grace_period, downtime_replicas)
     if 'stacks' in include_resources:
         autoscale_resources(api, Stack, namespace, exclude_namespaces, exclude_statefulsets, upscale_period, downscale_period,
